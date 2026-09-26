@@ -105,6 +105,20 @@ def _pending_change(
     ).fetchone()
 
 
+def _pending_switch(
+    conn: sqlite3.Connection, scope: str, tenant: str, route: str
+) -> Optional[sqlite3.Row]:
+    """该策略待生效定时切换的新参数与生效时刻；无 pending 行时返回 None。
+
+    同一策略至多一条 pending（见 policy_changes 部分唯一索引），故 fetchone。
+    """
+    return conn.execute(
+        "SELECT new_capacity, new_refill_rate, effective_at FROM policy_changes "
+        "WHERE scope=? AND tenant_id=? AND route_id=? AND status='pending'",
+        (scope, tenant, route),
+    ).fetchone()
+
+
 def upsert_policy(
     conn: sqlite3.Connection,
     *,
@@ -778,6 +792,140 @@ def _maybe_emit_low_balance(
         )
 
 
+def _ready_seconds_within_segment(
+    balance: float, capacity: float, rate: float, cost: float, seg_len: float
+) -> Optional[float]:
+    """在「容量/速率恒定、时间窗口长度 seg_len」的单段内，余额从 balance 起按
+    rate 线性补充（上限 capacity），求段内（不含右端点）首次达到 cost 的距段首
+    秒数。
+
+    返回 None 表示在该段内永远达不到（cost 超过容量，或补充率为 0 且当前不足）；
+    返回 0 表示段首已足额。段右端点是某桶的 effective_at：恰在该时刻足额的判定
+    必须由下一段按切换后余额给出，故恰等于 seg_len 不落在本段。
+    """
+    if balance + 1e-12 >= cost:
+        return 0.0
+    if cost > capacity + 1e-12 or rate <= 0.0:
+        return None
+    wait = (float(cost) - balance) / float(rate)
+    return wait if wait < seg_len else None
+
+
+def _project_earliest_ready(
+    states: list[dict[str, Any]], cost: float, now: datetime
+) -> Optional[float]:
+    """从裁决时刻 now 起预测：所有命中桶都达到 cost 的最早时刻距 now 的秒数。
+
+    纯计算，不落库、不提前应用任何切换。每个命中桶可以有至多一条待生效切换
+    （state["pending"] 为 None 表示无）。切换会把时间轴切成「旧策略段」与
+    「新策略段」，跨全部命中桶取所有切换时刻作为分段边界，逐段推进：
+
+      - 段内各桶容量/速率恒定，余额按当前速率线性补充、以当前容量封顶；
+      - 段末（=某桶 effective_at）该桶先按旧策略补到段末，再按现有剩余比例
+        规则换算容量（旧容量为 0 -> 0；否则 旧余额/旧容量×新容量，封顶新容量），
+        时间锚点移到段末，下一段起按新速率补充；
+      - 每段检查「全部桶在段内同一时刻足额」：取各桶在段内就绪秒数的最大值，
+        若该最大值仍落在段内，它就是整组最早可重试时刻；否则推进到下一段。
+
+    必须逐段处理而不能只按当前速率外推：容量下调的切换会让某桶在切换前
+    短暂足额、切换后反而永远不足（各桶足额时刻的集合可能不连续）。
+    任何桶在任一未来段都无法足额 -> 返回 None（retry_possible=false）。
+    """
+    proj: list[dict[str, Any]] = []
+    boundaries: list[float] = []
+    for s in states:
+        ch = s.get("pending")
+        boundary: Optional[float] = None
+        p: dict[str, Any] = {
+            "balance": float(s["balance"]),
+            "capacity": float(s["capacity"]),
+            "rate": float(s["refill_rate"]),
+            "boundary": None,
+        }
+        if ch is not None:
+            eff = parse_iso(ch["effective_at"])
+            delta = (eff - now).total_seconds()
+            if delta <= 0.0:
+                # 防御：到期切换已在本事务前半段应用，pending 必在未来；
+                # 若极端情况下拿到时刻 <= now 的行，按与 _apply_policy_change
+                # 相同的规则在生效瞬间换算（先按旧策略补到生效时刻，再按比例缩放）
+                at_eff = min(
+                    p["capacity"],
+                    p["balance"] + max(0.0, delta) * p["rate"],
+                )
+                p = {
+                    "balance": _scale_at_effective(
+                        at_eff, p["capacity"], float(ch["new_capacity"])
+                    ),
+                    "capacity": float(ch["new_capacity"]),
+                    "rate": float(ch["new_refill_rate"]),
+                    "boundary": None,
+                }
+            else:
+                boundary = delta
+                p["boundary"] = boundary
+                p["new_capacity"] = float(ch["new_capacity"])
+                p["new_rate"] = float(ch["new_refill_rate"])
+                boundaries.append(boundary)
+        proj.append(p)
+
+    # 去重并按 effective 偏移排序的分段边界（至少含最后一段的无穷远终点）
+    cuts = sorted(set(boundaries))
+    seg_start = 0.0
+    seg_index = 0
+    while True:
+        seg_end = cuts[seg_index] if seg_index < len(cuts) else float("inf")
+        seg_len = seg_end - seg_start
+
+        ready: list[float] = []
+        for p in proj:
+            w = _ready_seconds_within_segment(
+                p["balance"], p["capacity"], p["rate"], cost, seg_len
+            )
+            if w is None:
+                ready = None
+                break
+            ready.append(w)
+        if ready is not None:
+            # 段内各桶就绪时刻的最大值仍是同一时刻（段内，不含段右端点）->
+            # 整组首次足额
+            candidate = max(ready)
+            if candidate < seg_len:
+                return seg_start + candidate
+
+        if seg_index >= len(cuts):
+            return None  # 最后一段（全部切换已生效）仍无法整组足额
+
+        # 推进到下一段：恰在段末切换的桶先按旧速率补到段末再按剩余比例换算，
+        # 其余桶按当前速率把时间应得的令牌补到段末（以各自当前容量封顶），
+        # 所有桶的时间锚点统一前移到段末
+        for p in proj:
+            p["balance"] = min(
+                p["capacity"], p["balance"] + seg_len * p["rate"]
+            )
+            if p["boundary"] == seg_end:
+                p["balance"] = _scale_at_effective(
+                    p["balance"], p["capacity"], p["new_capacity"]
+                )
+                p["capacity"] = p["new_capacity"]
+                p["rate"] = p["new_rate"]
+                p["boundary"] = None
+        seg_start = seg_end
+        seg_index += 1
+
+
+def _scale_at_effective(
+    old_balance: float, old_capacity: float, new_capacity: float
+) -> float:
+    """切换瞬间的剩余比例换算：旧容量为 0 -> 0，否则按比例缩放并以新容量封顶。
+
+    调用前旧余额应已按旧策略补充到 effective_at（上限旧容量）。
+    """
+    if old_capacity <= 0.0:
+        return 0.0
+    return min(new_capacity, old_balance / old_capacity * new_capacity)
+
+
 def decide(
     conn: sqlite3.Connection,
     *,
@@ -791,6 +939,11 @@ def decide(
     命中的每个桶在同一事务、同一时刻 now 下：
       1. 按距上次更新经过的时间补充令牌（不超过容量）；
       2. 全部桶余额都足够才统一扣减；任一不足则一个都不扣。
+
+    拒绝时的最早可重试时刻以 now 为起点做前向预测（见
+    _project_earliest_ready）：命中桶若有待生效的定时切换，切换前按旧速率
+    补充、到 effective_at 按剩余比例换算容量、此后按新速率补充，跨全部命中
+    层取首次同时足额的时刻；预测只读取 pending 行，不提前应用切换。
     """
     if cost <= 0:
         raise HTTPException(422, "cost 必须为正数")
@@ -899,25 +1052,24 @@ def decide(
             )
         retry_at, retry_after, retry_possible = None, None, True
     else:
-        # 整组最早可重试时刻 = 各不足桶就绪耗时的最大值
-        waits: list[float] = []
-        retry_possible = True
+        # 整组最早可重试时刻：以裁决时刻 now 为起点预测各命中桶余额，
+        # 命中桶若有待生效（pending）的定时切换，必须把切换纳入预测：
+        # 切换前按旧速率补充，到 effective_at 按现有剩余比例规则换算容量，
+        # 此后按新速率补充；跨全部命中层求首次同时足额的时刻。
+        # 只读取 pending 行用于预测，绝不提前应用（策略/桶的实际状态、
+        # 拒绝落账与 request_id 重放语义都不因预测而改变）。
         for s in states:
-            if s["balance"] + 1e-12 >= cost:
-                continue
-            deficit = float(cost) - s["balance"]
-            rate = s["refill_rate"]
-            # rate=0 永不补充，或 cost 超过桶容量 -> 无论等多久都不可能通过
-            if rate <= 0 or float(cost) > s["capacity"] + 1e-12:
-                retry_possible = False
-                break
-            waits.append(deficit / rate)
-        if retry_possible:
-            wait = max(waits)
-            retry_dt = now + timedelta(seconds=wait)
-            retry_at, retry_after = iso(retry_dt), max(0.0, wait)
-        else:
+            s["pending"] = _pending_switch(
+                conn, s["scope"], s["tenant"], s["route"]
+            )
+        wait = _project_earliest_ready(states, float(cost), now)
+        if wait is None:
+            retry_possible = False
             retry_at, retry_after = None, None
+        else:
+            retry_possible = True
+            wait = max(0.0, wait)
+            retry_at, retry_after = iso(now + timedelta(seconds=wait)), wait
         # 拒绝不扣减，但补充后的余额（时间应得的令牌）一律落库
         for s in states:
             conn.execute(

@@ -847,6 +847,153 @@ def test_cancel_after_effective_time_conflicts(client):
     assert admin_call(client, "DELETE", "/policy-changes/ch2").status_code == 409
 
 
+# -------------------------------------------- 拒绝重试时间对 pending 切换的预测
+
+
+def _parse_iso(text: str) -> datetime:
+    return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+
+def test_retry_time_pending_rate_increase_makes_retry_possible(client):
+    # 旧速率 0 会被旧逻辑判为永不可重试；100s 后切到 2/s：
+    # 切换点余额仍为 0（比例 0），此后补 4 个令牌需 2s -> 最早 102s
+    put_policy(client, "global", 10, 0)
+    client.post("/decide", json={"request_id": "drain", "cost": 10})  # 打空
+    post_change(client, "ch1", "global", 10, 2, effective_in=100)
+
+    r = client.post("/decide", json={"request_id": "d1", "cost": 4}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is True
+    assert r["retry_after_seconds"] == pytest.approx(102.0, abs=0.5)
+    decided = _parse_iso(r["decided_at"])
+    retry_at = _parse_iso(r["retry_at"])
+    assert (retry_at - decided).total_seconds() == pytest.approx(
+        r["retry_after_seconds"], abs=1e-6
+    )
+    # 预测不提前应用切换：响应桶与观察接口仍是旧策略，变更保持 pending
+    assert r["buckets"][0]["capacity"] == 10.0
+    assert r["buckets"][0]["refill_rate"] == 0.0
+    assert client.get("/buckets").json()[0]["refill_rate"] == 0.0
+    assert client.get("/policy-changes/ch1").json()["status"] == "pending"
+
+
+def test_retry_time_pending_capacity_increase_ready_at_effective(client):
+    # cost=8 超过当前容量 5（旧逻辑判永不可重试）；100s 后容量升到 20。
+    # 桶尚未被扣过（满额比例 1），切换点 5/5 按比例换算到 20/20 立即可用
+    # （新速率 0 也够用）-> 最早恰为生效时刻 100s
+    put_policy(client, "global", 5, 0)
+    post_change(client, "ch1", "global", 20, 0, effective_in=100)
+
+    r = client.post("/decide", json={"request_id": "d1", "cost": 8}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is True
+    assert r["retry_after_seconds"] == pytest.approx(100.0, abs=0.5)
+    # 桶在拒绝时以满额惰性落库（balance=5，仍为旧容量）
+    assert r["buckets"][0]["balance"] == 5.0
+    assert r["buckets"][0]["capacity"] == 5.0
+
+
+def test_retry_time_impossible_when_cost_above_both_capacities(client):
+    put_policy(client, "global", 5, 0)
+    client.post("/decide", json={"request_id": "drain", "cost": 5})
+    post_change(client, "ch1", "global", 20, 0, effective_in=100)
+
+    r = client.post("/decide", json={"request_id": "d1", "cost": 21}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is False
+    assert r["retry_at"] is None
+    assert r["retry_after_seconds"] is None
+
+
+def test_retry_time_before_effective_uses_old_rate(client):
+    # 旧速率 2/s，切换在 100s 后（新速率 0）；cost=10 在切换前 5s 即就绪，
+    # 必须返回旧速率算出的 5s，而不是切换后的永不可重试
+    put_policy(client, "global", 100, 2)
+    client.post("/decide", json={"request_id": "drain", "cost": 100})
+    post_change(client, "ch1", "global", 100, 0, effective_in=100)
+
+    r = client.post("/decide", json={"request_id": "d1", "cost": 10}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is True
+    assert r["retry_after_seconds"] == pytest.approx(5.0, abs=0.5)
+
+
+def test_retry_time_downscale_window_then_impossible_after(client):
+    # 旧容量 100、1/s；50s 后缩到容量 10、速率 0。
+    # cost=10 在旧策略下 10s（< 50s）即可，落在切换前窗口 -> 10s；
+    # cost=60 在切换前补不到（需 60s > 50s），切换后容量只有 10 -> 永不可重试
+    put_policy(client, "global", 100, 1)
+    client.post("/decide", json={"request_id": "drain", "cost": 100})
+    post_change(client, "ch1", "global", 10, 0, effective_in=50)
+
+    r = client.post("/decide", json={"request_id": "d1", "cost": 10}).json()
+    assert r["retry_possible"] is True
+    assert r["retry_after_seconds"] == pytest.approx(10.0, abs=0.5)
+
+    r = client.post("/decide", json={"request_id": "d2", "cost": 60}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is False
+    assert r["retry_at"] is None
+
+
+def test_retry_time_max_across_buckets_with_pending_switch(client):
+    # 全局桶 10 容量 2/s（无切换），cost=4 -> 2s 就绪；
+    # 租户桶 10 容量 0/s，3s 后切到 10/s：切换后补 4 个需 0.4s -> 3.4s。
+    # 跨两层取最大 -> 3.4s
+    put_policy(client, "global", 10, 2)
+    put_policy(client, "tenant", 10, 0, tenant="t")
+    client.post(
+        "/decide", json={"request_id": "drain", "tenant_id": "t", "cost": 10}
+    )
+    post_change(client, "ct", "tenant", 10, 10, tenant="t", effective_in=3)
+
+    r = client.post(
+        "/decide", json={"request_id": "d1", "tenant_id": "t", "cost": 4}
+    ).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is True
+    assert r["retry_after_seconds"] == pytest.approx(3.4, abs=0.4)
+
+
+def test_retry_time_uses_proportional_rescale_then_new_rate(client):
+    # 旧容量 10、速率 0，余额 8（剩余比例 0.8）；100s 后切到容量 20、2/s。
+    # cost=20 在切换前不可能（容量只有 10）；切换点余额 8 不补充（速率 0），
+    # 按比例换算为 16，此后按 2/s 补到 20 需 2s -> 最早 102s
+    put_policy(client, "global", 10, 0)
+    client.post("/decide", json={"request_id": "seed", "cost": 2})  # 10 -> 8
+    post_change(client, "ch1", "global", 20, 2, effective_in=100)
+
+    r = client.post("/decide", json={"request_id": "d1", "cost": 20}).json()
+    assert r["allowed"] is False
+    assert r["retry_possible"] is True
+    assert r["retry_after_seconds"] == pytest.approx(102.0, abs=0.5)
+
+
+def test_retry_projection_keeps_pending_and_replay_semantics(client):
+    put_policy(client, "global", 10, 0)
+    client.post("/decide", json={"request_id": "drain", "cost": 10})
+    post_change(client, "ch1", "global", 10, 1, effective_in=3600)
+
+    payload = {"request_id": "d1", "cost": 1}
+    first = client.post("/decide", json=payload).json()
+    assert first["allowed"] is False
+    assert first["retry_possible"] is True
+    # 3600s 后切换，余额比例 0，按 1/s 补 1 个 -> 3601s
+    assert first["retry_after_seconds"] == pytest.approx(3601.0, abs=1.0)
+    # 变更未被提前应用，pending 期间 PUT 仍冲突
+    assert client.get("/policy-changes/ch1").json()["status"] == "pending"
+    assert put_policy(client, "global", 10, 0).status_code == 409
+
+    # 同 request_id 重放：返回存档结果，retry_at 不重算，桶与切换均无变化
+    replay = client.post("/decide", json=payload).json()
+    assert replay["allowed"] is False
+    assert replay["replayed"] is True
+    assert replay["retry_at"] == first["retry_at"]
+    assert replay["retry_after_seconds"] == first["retry_after_seconds"]
+    assert client.get("/policy-changes/ch1").json()["status"] == "pending"
+    assert client.get("/buckets").json()[0]["refill_rate"] == 0.0
+
+
 # ------------------------------------------------------------ 策略版本审计与回滚
 
 
