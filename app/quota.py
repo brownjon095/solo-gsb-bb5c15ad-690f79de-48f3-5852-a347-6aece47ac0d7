@@ -778,6 +778,121 @@ def _maybe_emit_low_balance(
         )
 
 
+def _pending_change_map(
+    conn: sqlite3.Connection, keys: list[tuple[str, str, str]]
+) -> dict[tuple[str, str, str], tuple[datetime, float, float]]:
+    """各命中策略键的待生效（pending）变更：键 -> (effective_at, 新容量, 新速率)。
+
+    到期变更已在本次裁决事务开始时由 _apply_due_changes 应用，剩下的
+    pending 变更 effective_at 必在未来；同一策略至多一条 pending
+    （唯一索引 idx_policy_changes_one_pending 保证）。
+    """
+    out: dict[tuple[str, str, str], tuple[datetime, float, float]] = {}
+    for scope, tenant, route in keys:
+        row = conn.execute(
+            "SELECT effective_at, new_capacity, new_refill_rate "
+            "FROM policy_changes "
+            "WHERE scope=? AND tenant_id=? AND route_id=? AND status='pending'",
+            (scope, tenant, route),
+        ).fetchone()
+        if row is not None:
+            out[(scope, tenant, route)] = (
+                parse_iso(row["effective_at"]),
+                float(row["new_capacity"]),
+                float(row["new_refill_rate"]),
+            )
+    return out
+
+
+def _segment_ready_at(
+    bal: float,
+    cap: float,
+    rate: float,
+    cost: float,
+    start: float,
+    end: Optional[float],
+) -> Optional[float]:
+    """余额在 [start, end)（end=None 表示无界）内按 min(cap, bal+(t-start)*rate)
+    变化时，首次达到 cost 的时刻；本段内不可达返回 None。
+
+    边界点 end 属于下一段（切换在 effective_at 时刻先按比例换算余额），
+    故本段的就绪时刻必须严格小于 end。
+    """
+    if bal + 1e-12 >= cost:
+        return start
+    if rate <= 0.0 or cost > cap + 1e-12:
+        return None
+    t = start + (cost - bal) / rate
+    if end is not None and t >= end:
+        return None
+    return t
+
+
+def _first_sufficient_wait(
+    states: list[dict[str, Any]],
+    changes: dict[tuple[str, str, str], tuple[datetime, float, float]],
+    cost: float,
+    now: datetime,
+) -> Optional[float]:
+    """从裁决时刻 now 起，预测全部命中桶首次同时 >= cost 的等待秒数；不可能为 None。
+
+    纯演算（不读写库、不提前应用切换）：各桶先按当前策略补充；有待生效
+    变更的桶到 effective_at 按「旧余额 / 旧容量 × 新容量」的剩余比例规则
+    换算（旧容量为 0 则余额归零），此后按新速率补充。切换时刻余额可能
+    跳变（放大或缩小），因此以各切换时刻为界逐段考察：段内各桶余额单调
+    不减，全部就绪即取各就绪时刻的最大值；第一段产生可行解即为答案，
+    最终段仍有桶不可达则永不可重试。
+    """
+    # 每桶当前段的 (段起点余额, 容量, 速率) 与切换点（距 now 的秒数）
+    tracks: list[dict[str, Any]] = []
+    for s in states:
+        switch = None
+        ch = changes.get((s["scope"], s["tenant"], s["route"]))
+        if ch is not None:
+            eff, new_cap, new_rate = ch
+            switch = (max(0.0, (eff - now).total_seconds()), new_cap, new_rate)
+        tracks.append(
+            {
+                "bal": float(s["balance"]),
+                "cap": float(s["capacity"]),
+                "rate": float(s["refill_rate"]),
+                "switch": switch,
+            }
+        )
+
+    events = sorted({t["switch"][0] for t in tracks if t["switch"] is not None})
+    start = 0.0
+    for end in [*events, None]:  # None 收尾：最终段 [start, +∞)
+        ready_max = start
+        for t in tracks:
+            ready = _segment_ready_at(
+                t["bal"], t["cap"], t["rate"], cost, start, end
+            )
+            if ready is None:
+                break
+            ready_max = max(ready_max, ready)
+        else:
+            return ready_max
+        if end is None:
+            return None
+        # 推进到 end：各桶先按段内速率补充到该时刻，到点切换的桶再按
+        # 剩余比例换算容量（与 _apply_policy_change 同一套规则）
+        for t in tracks:
+            bal = min(t["cap"], t["bal"] + (end - start) * t["rate"])
+            if t["switch"] is not None and t["switch"][0] == end:
+                _, new_cap, new_rate = t["switch"]
+                bal = (
+                    0.0
+                    if t["cap"] <= 0.0
+                    else min(new_cap, bal / t["cap"] * new_cap)
+                )
+                t["cap"], t["rate"] = new_cap, new_rate
+                t["switch"] = None  # 同一策略至多一条 pending
+            t["bal"] = bal
+        start = end
+    return None  # pragma: no cover - 不可达：最终段必然 return
+
+
 def decide(
     conn: sqlite3.Connection,
     *,
@@ -791,6 +906,8 @@ def decide(
     命中的每个桶在同一事务、同一时刻 now 下：
       1. 按距上次更新经过的时间补充令牌（不超过容量）；
       2. 全部桶余额都足够才统一扣减；任一不足则一个都不扣。
+    拒绝时的重试时间把命中桶待生效的定时切换纳入预测（见
+    _first_sufficient_wait），但只演算不落库，切换不会提前应用。
     """
     if cost <= 0:
         raise HTTPException(422, "cost 必须为正数")
@@ -899,25 +1016,21 @@ def decide(
             )
         retry_at, retry_after, retry_possible = None, None, True
     else:
-        # 整组最早可重试时刻 = 各不足桶就绪耗时的最大值
-        waits: list[float] = []
-        retry_possible = True
-        for s in states:
-            if s["balance"] + 1e-12 >= cost:
-                continue
-            deficit = float(cost) - s["balance"]
-            rate = s["refill_rate"]
-            # rate=0 永不补充，或 cost 超过桶容量 -> 无论等多久都不可能通过
-            if rate <= 0 or float(cost) > s["capacity"] + 1e-12:
-                retry_possible = False
-                break
-            waits.append(deficit / rate)
-        if retry_possible:
-            wait = max(waits)
+        # 整组最早可重试时刻：以裁决时刻为起点纯演算——各命中桶先按当前
+        # 策略补充；命中层若有待生效（pending）的定时切换，到 effective_at
+        # 按剩余比例换算容量、此后按新速率补充；跨全部命中层取首次同时
+        # 足额的时刻。演算不改动任何落库状态（切换不会提前应用）。
+        changes = _pending_change_map(
+            conn, [(s["scope"], s["tenant"], s["route"]) for s in states]
+        )
+        wait = _first_sufficient_wait(states, changes, float(cost), now)
+        if wait is None:
+            retry_possible = False
+            retry_at, retry_after = None, None
+        else:
+            retry_possible = True
             retry_dt = now + timedelta(seconds=wait)
             retry_at, retry_after = iso(retry_dt), max(0.0, wait)
-        else:
-            retry_at, retry_after = None, None
         # 拒绝不扣减，但补充后的余额（时间应得的令牌）一律落库
         for s in states:
             conn.execute(
